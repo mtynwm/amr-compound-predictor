@@ -1,7 +1,10 @@
-streamlit
-scikit-learn
-rdkit
-pandas
-openpyxl
-joblib
-requests
+# scikit-learn dikunci pada versi yang dipakai saat melatih model.
+# Memuat berkas model dengan versi berbeda dapat gagal atau memberi hasil tak terduga.
+scikit-learn==1.8.0
+streamlit>=1.64
+rdkit>=2024.3
+pandas>=2.2
+numpy>=2.0
+openpyxl>=3.1
+joblib>=1.4
+requests>=2.31

@@ -3,13 +3,23 @@ import io
 import json
 from pathlib import Path
 
+import altair as alt
 import joblib
 import pandas as pd
 import streamlit as st
 from rdkit.Chem.Draw import rdMolDraw2D
 
 from config import DEFAULT_TARGET_ID, get_target
-from db import fetch_all, get_connection, insert_prediction
+from db import (
+    clear_predictions,
+    delete_compound,
+    delete_predictions,
+    fetch_all,
+    fetch_compounds,
+    get_connection,
+    insert_prediction,
+    save_compound,
+)
 from featurize import DESCRIPTOR_NAMES, featurize, smiles_to_mol
 
 MODELS_DIR = Path(__file__).parent / "models"
@@ -42,6 +52,15 @@ CONTOH_SENYAWA = {
     "Aspirin (bukan antibiotik)": "CC(=O)OC1=CC=CC=C1C(=O)O",
     "Kafein (bukan antibiotik)": "CN1C=NC2=C1C(=O)N(C)C(=O)N2C",
 }
+
+PILIHAN_KOSONG = "— ketik SMILES sendiri —"
+
+CSV_CONTOH = (
+    "smiles\n"
+    "CC(=O)OC1=CC=CC=C1C(=O)O\n"
+    "CN1C=NC2=C1C(=O)N(C)C(=O)N2C\n"
+    "CC1(C)S[C@@H]2[C@H](NC(=O)[C@H](N)c3ccc(O)cc3)C(=O)N2[C@H]1C(=O)O\n"
+)
 
 
 # ---------------------------------------------------------------- loaders (cached)
@@ -106,6 +125,24 @@ def descriptor_grid(descriptors, columns=3):
             col.metric(label, shown, border=True)
 
 
+def lipinski_summary(descriptors):
+    """Rule of Five — aturan keterobatan oral yang lazim dipakai di kimia medisinal."""
+    aturan = [
+        ("Berat molekul ≤ 500", descriptors["MolWt"] <= 500, f"{descriptors['MolWt']:.1f}"),
+        ("LogP ≤ 5", descriptors["LogP"] <= 5, f"{descriptors['LogP']:.2f}"),
+        ("Donor ikatan H ≤ 5", descriptors["NumHDonors"] <= 5, f"{descriptors['NumHDonors']:.0f}"),
+        ("Akseptor ikatan H ≤ 10", descriptors["NumHAcceptors"] <= 10,
+         f"{descriptors['NumHAcceptors']:.0f}"),
+    ]
+    pelanggaran = sum(1 for _, lolos, _ in aturan if not lolos)
+    df = pd.DataFrame({
+        "Kriteria": [a[0] for a in aturan],
+        "Nilai": [a[2] for a in aturan],
+        "Status": ["Memenuhi" if a[1] else "Tidak memenuhi" for a in aturan],
+    })
+    return df, pelanggaran
+
+
 # ---------------------------------------------------------------- setup
 target_cfg = get_target(DEFAULT_TARGET_ID)
 model_path = MODELS_DIR / f"model_{target_cfg['id']}.joblib"
@@ -160,8 +197,9 @@ def predict(smiles):
     }
 
 
-def save_prediction(smiles, result):
+def save_prediction(smiles, result, nama=None):
     insert_prediction(conn, {
+        "compound_name": nama or None,
         "smiles": smiles,
         "canonical_smiles": smiles,
         "target_id": target_cfg["id"],
@@ -235,20 +273,47 @@ elif halaman == "Skrining Senyawa":
     st.title("Skrining Senyawa")
     st.caption("Masukkan struktur senyawa dalam format SMILES untuk memprediksi aktivitas antibakterinya.")
 
+    with st.expander("Apa itu SMILES dan dari mana mendapatkannya?"):
+        st.markdown("""
+**SMILES** (*Simplified Molecular Input Line Entry System*) adalah cara menuliskan struktur
+molekul sebagai satu baris teks. Contohnya, aspirin ditulis `CC(=O)OC1=CC=CC=C1C(=O)O`.
+
+Kode SMILES suatu senyawa bisa diperoleh dengan beberapa cara:
+
+- **PubChem** (pubchem.ncbi.nlm.nih.gov) — cari nama senyawanya, lalu salin bagian *Canonical SMILES*
+- **ChemDraw, MarvinSketch, atau Avogadro** — gambar strukturnya, lalu salin sebagai SMILES
+- **Dropdown contoh di bawah** — berisi beberapa senyawa siap pakai untuk mencoba
+
+Senyawa yang Anda beri nama akan tersimpan dan muncul di dropdown tersebut, sehingga bisa
+dipanggil kembali tanpa menyalin ulang SMILES-nya.
+""")
+
+    tersimpan = {f"★ {c['name']}": c["smiles"] for c in fetch_compounds(conn)}
+    semua_pilihan = {**tersimpan, **CONTOH_SENYAWA}
+
     pilihan = st.selectbox(
-        "Contoh senyawa (opsional)",
-        ["— pilih untuk mengisi otomatis —"] + list(CONTOH_SENYAWA.keys()),
+        "Pilih senyawa tersimpan atau contoh (opsional)",
+        [PILIHAN_KOSONG] + list(semua_pilihan.keys()),
     )
-    nilai_awal = CONTOH_SENYAWA.get(pilihan, "")
+    nilai_awal = semua_pilihan.get(pilihan, "")
+    nama_awal = pilihan[2:] if pilihan.startswith("★ ") else ""
 
     with st.form("single_form"):
-        smiles_input = st.text_input(
+        c_nama, c_smiles = st.columns([1, 2])
+        nama_input = c_nama.text_input(
+            "Nama senyawa (opsional)", value=nama_awal, placeholder="misal: Senyawa uji A"
+        )
+        smiles_input = c_smiles.text_input(
             "SMILES", value=nilai_awal, placeholder="CC(=O)OC1=CC=CC=C1C(=O)O"
+        )
+        simpan = st.checkbox(
+            "Simpan ke daftar senyawa saya (agar muncul di dropdown)", value=bool(nama_awal)
         )
         submitted = st.form_submit_button("Prediksi Aktivitas", type="primary")
 
     if submitted:
         smiles = smiles_input.strip()
+        nama = nama_input.strip()
         if not smiles:
             st.warning("Isi kolom SMILES terlebih dahulu.")
         else:
@@ -260,11 +325,18 @@ elif halaman == "Skrining Senyawa":
                 )
             else:
                 result = predict(smiles)
-                save_prediction(smiles, result)
+                save_prediction(smiles, result, nama)
+
+                if simpan:
+                    if nama:
+                        save_compound(conn, nama, smiles)
+                        st.success(f"Senyawa **{nama}** tersimpan ke daftar Anda.")
+                    else:
+                        st.warning("Beri nama senyawanya dulu agar bisa disimpan ke daftar.")
 
                 kiri, kanan = st.columns([1, 1])
                 with kiri:
-                    st.image(draw_molecule(mol), caption="Struktur molekul")
+                    st.image(draw_molecule(mol), caption=nama or "Struktur molekul")
                 with kanan:
                     result_card(result["label"], result["confidence"])
                     if result["label"] == "Aktif":
@@ -282,15 +354,51 @@ elif halaman == "Skrining Senyawa":
                 st.subheader("Sifat Fisikokimia")
                 descriptor_grid(result["descriptors"])
 
+                st.subheader("Aturan Lipinski (Rule of Five)")
+                lip_df, pelanggaran = lipinski_summary(result["descriptors"])
+                st.dataframe(lip_df, hide_index=True, width="stretch")
+                if pelanggaran == 0:
+                    st.caption("Memenuhi seluruh kriteria Lipinski.")
+                else:
+                    st.caption(
+                        f"Terdapat {pelanggaran} kriteria yang tidak terpenuhi. Perlu dicatat bahwa "
+                        "banyak antibiotik memang melanggar aturan ini — vankomisin, misalnya, "
+                        "melanggar hampir seluruhnya namun tetap efektif secara klinis. Aturan "
+                        "Lipinski memperkirakan keterserapan obat oral, bukan potensi aktivitasnya."
+                    )
+
+    st.divider()
+    with st.expander("Kelola daftar senyawa saya"):
+        daftar = fetch_compounds(conn)
+        if not daftar:
+            st.caption("Belum ada senyawa tersimpan. Beri nama saat melakukan prediksi di atas.")
+        else:
+            st.dataframe(
+                pd.DataFrame(daftar)[["name", "smiles", "created_at"]],
+                hide_index=True, width="stretch",
+                column_config={
+                    "name": st.column_config.TextColumn("Nama"),
+                    "smiles": st.column_config.TextColumn("SMILES", width="large"),
+                    "created_at": st.column_config.TextColumn("Disimpan pada"),
+                },
+            )
+            hapus = st.selectbox("Hapus senyawa", [""] + [c["name"] for c in daftar])
+            if st.button("Hapus", disabled=not hapus):
+                delete_compound(conn, hapus)
+                st.rerun()
+
     st.divider()
     st.subheader("Skrining Banyak Senyawa Sekaligus")
-    st.caption("Unggah file CSV yang memiliki kolom bernama `smiles`.")
-    uploaded = st.file_uploader("Pilih file CSV", type=["csv"], label_visibility="collapsed")
+    st.caption("Unggah berkas CSV yang memiliki kolom bernama `smiles`.")
+    st.download_button(
+        "⬇️ Unduh contoh berkas CSV", CSV_CONTOH, "contoh_senyawa.csv", "text/csv"
+    )
+    uploaded = st.file_uploader("Pilih berkas CSV", type=["csv"], label_visibility="collapsed")
 
     if uploaded is not None:
         batch_df = pd.read_csv(uploaded)
         if "smiles" not in batch_df.columns:
-            st.error("File CSV harus memiliki kolom bernama `smiles`.")
+            st.error("Berkas CSV harus memiliki kolom bernama `smiles`.")
         else:
             progress = st.progress(0.0, text="Memproses senyawa...")
             hasil = []
@@ -339,13 +447,15 @@ elif halaman == "Riwayat Prediksi":
         c1, c2, c3 = st.columns([1, 1, 2])
         filter_label = c1.selectbox("Filter hasil", ["Semua", "Aktif", "Tidak Aktif"])
         urutan = c2.selectbox("Urutkan", ["Terbaru", "Confidence tertinggi"])
-        cari = c3.text_input("Cari SMILES", placeholder="ketik sebagian SMILES...")
+        cari = c3.text_input("Cari nama atau SMILES", placeholder="ketik sebagian nama/SMILES...")
 
         filtered = df.copy()
         if filter_label != "Semua":
             filtered = filtered[filtered["predicted_label"] == filter_label]
         if cari:
-            filtered = filtered[filtered["smiles"].str.contains(cari, case=False, na=False)]
+            cocok_smiles = filtered["smiles"].str.contains(cari, case=False, na=False)
+            cocok_nama = filtered["compound_name"].fillna("").str.contains(cari, case=False, na=False)
+            filtered = filtered[cocok_smiles | cocok_nama]
         filtered = filtered.sort_values(
             "confidence" if urutan == "Confidence tertinggi" else "predicted_at",
             ascending=False,
@@ -358,14 +468,20 @@ elif halaman == "Riwayat Prediksi":
         k3.metric("Diprediksi Tidak Aktif", len(filtered) - n_aktif, border=True)
 
         tampil = filtered[[
-            "smiles", "predicted_label", "confidence", "mol_wt", "log_p", "tpsa", "predicted_at",
+            "id", "compound_name", "smiles", "predicted_label", "confidence",
+            "mol_wt", "log_p", "tpsa", "predicted_at",
         ]].copy()
+        tampil["compound_name"] = tampil["compound_name"].fillna("—")
         tampil["confidence"] = tampil["confidence"] * 100
 
-        st.dataframe(
+        st.caption("Centang baris di kolom paling kiri untuk menghapusnya.")
+        seleksi = st.dataframe(
             tampil, hide_index=True, width="stretch",
+            on_select="rerun", selection_mode="multi-row",
             column_config={
-                "smiles": st.column_config.TextColumn("SMILES", width="large"),
+                "id": None,
+                "compound_name": st.column_config.TextColumn("Nama Senyawa"),
+                "smiles": st.column_config.TextColumn("SMILES", width="medium"),
                 "predicted_label": st.column_config.TextColumn("Prediksi"),
                 "confidence": st.column_config.ProgressColumn(
                     "Confidence", format="%.1f%%", min_value=0, max_value=100
@@ -377,6 +493,18 @@ elif halaman == "Riwayat Prediksi":
             },
         )
 
+        terpilih = seleksi.selection.rows if hasattr(seleksi, "selection") else []
+        h1, h2 = st.columns(2)
+        if h1.button(
+            f"🗑️ Hapus {len(terpilih)} baris terpilih", disabled=not terpilih, width="stretch"
+        ):
+            delete_predictions(conn, tampil.iloc[terpilih]["id"].tolist())
+            st.rerun()
+        if h2.button("Kosongkan seluruh riwayat", width="stretch"):
+            clear_predictions(conn, target_cfg["id"])
+            st.rerun()
+
+        st.divider()
         e1, e2 = st.columns(2)
         e1.download_button(
             "⬇️ Export CSV", filtered.to_csv(index=False).encode("utf-8"),
@@ -408,9 +536,19 @@ elif halaman == "SAR Insight":
         "Fitur": "Fingerprint (pola struktur)",
         "Kontribusi": float(importances[n_desc:].sum()),
     })
-    importance_df = pd.DataFrame(importance_rows).sort_values("Kontribusi", ascending=False)
+    importance_df = pd.DataFrame(importance_rows)
 
-    st.bar_chart(importance_df, x="Fitur", y="Kontribusi", horizontal=True, height=380)
+    chart = (
+        alt.Chart(importance_df)
+        .mark_bar(color="#16a34a")
+        .encode(
+            x=alt.X("Kontribusi:Q", title="Kontribusi terhadap prediksi"),
+            y=alt.Y("Fitur:N", sort="-x", title=None),
+            tooltip=["Fitur", alt.Tooltip("Kontribusi:Q", format=".4f")],
+        )
+        .properties(height=360)
+    )
+    st.altair_chart(chart, use_container_width=True)
     st.caption(
         "Fingerprint struktur ditampilkan sebagai satu batang gabungan karena terdiri dari "
         "1.024 bit yang tidak bermakna bila dibaca satu per satu — nilainya merupakan total "

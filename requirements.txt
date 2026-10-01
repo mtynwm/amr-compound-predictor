@@ -2,6 +2,7 @@
 # Memuat berkas model dengan versi berbeda dapat gagal atau memberi hasil tak terduga.
 scikit-learn==1.8.0
 streamlit>=1.64
+altair>=5.0
 rdkit>=2024.3
 pandas>=2.2
 numpy>=2.0

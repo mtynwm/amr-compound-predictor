@@ -8,3 +8,6 @@ data/prediction_history.db
 *.log
 __pycache__/
 *.pyc
+
+# Screenshot bernama otomatis dari Windows (biasanya tersimpan tak sengaja)
+Screenshot *.png

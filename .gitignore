@@ -1,0 +1,10 @@
+# Cache data mentah ChEMBL (besar, bisa diunduh ulang oleh train_model.py)
+data/raw_activities_cache_*.jsonl
+
+# Riwayat prediksi lokal masing-masing pengguna
+data/prediction_history.db
+
+# Log dan berkas sementara
+*.log
+__pycache__/
+*.pyc
